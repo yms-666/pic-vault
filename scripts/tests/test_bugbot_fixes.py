@@ -2787,6 +2787,11 @@ def test_large_gallery_month_groups_and_back_top():
             'top:' in back_top_body and 'bottom:' not in back_top_body,
             detail=back_top_body.strip(),
         )
+        check(
+            'back top stays under sticky toolbar z-index',
+            'z-index: 5' in back_top_body,
+            detail=back_top_body.strip(),
+        )
 
         page2 = wb.build_gallery_page_payload(
             work, thumbs, 'screenshots', offset=wb.GALLERY_PAGE_SIZE,
@@ -2832,8 +2837,16 @@ def test_lightbox_video_controls_not_covered_by_action_bar():
 
     check('lightbox has media container style', '.lb-media' in wb.PAGE_CSS)
     check('lightbox reserves bottom safe space', '--lb-bar-safe' in wb.PAGE_CSS)
+    check(
+        'lightbox safe space includes home indicator',
+        '--lb-bar-safe: calc(118px + env(safe-area-inset-bottom, 0px))' in wb.PAGE_CSS,
+    )
+    check(
+        'lightbox mobile safe space includes home indicator',
+        '--lb-bar-safe: calc(184px + env(safe-area-inset-bottom, 0px))' in wb.PAGE_CSS,
+    )
     check('lightbox media max-height uses safe space', 'calc(100vh - var(--lb-bar-safe))' in wb.PAGE_CSS)
-    check('lightbox action bar offset uses safe area', 'env(safe-area-inset-bottom)' in wb.PAGE_CSS)
+    check('lightbox action bar offset uses safe area', 'env(safe-area-inset-bottom' in wb.PAGE_CSS)
 
 
 def main():

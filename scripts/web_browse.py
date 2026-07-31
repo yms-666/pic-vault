@@ -1511,8 +1511,9 @@ body.select-mode .toolbar-organize { display: flex; }
 .back-top {
   position: fixed;
   right: clamp(18px, 4vw, 44px);
-  top: calc(env(safe-area-inset-top) + 96px);
-  z-index: 30;
+  /* Sit below sticky toolbar (z-index 10); avoid covering filter chips. */
+  top: calc(env(safe-area-inset-top, 0px) + 120px);
+  z-index: 5;
   padding: 9px 14px;
   border: 1px solid var(--line);
   background: var(--paper);
@@ -1853,7 +1854,8 @@ body.select-mode .cell .fname {
 }
 
 .lb {
-  --lb-bar-safe: 118px;
+  /* Bar height + home-indicator; keep video controls above .lb-bar. */
+  --lb-bar-safe: calc(118px + env(safe-area-inset-bottom, 0px));
   display: flex;
   position: fixed;
   inset: 0;
@@ -1890,7 +1892,7 @@ body.select-mode .cell .fname {
 }
 .lb-bar {
   position: fixed;
-  bottom: max(20px, env(safe-area-inset-bottom));
+  bottom: max(20px, env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   display: grid;
@@ -1962,7 +1964,7 @@ body.select-mode .cell .fname {
 .lb-bar .lb-trash { color: #8f1d1d; }
 .lb-bar .lb-trash.busy { opacity: 0.55; pointer-events: none; }
 @media (max-width: 900px) {
-  .lb { --lb-bar-safe: 184px; }
+  .lb { --lb-bar-safe: calc(184px + env(safe-area-inset-bottom, 0px)); }
   .lb-bar { grid-template-columns: 1fr; align-items: stretch; }
   .lb-group { border-left: none; padding-left: 0; flex-wrap: wrap; }
 }
