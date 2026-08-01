@@ -1878,7 +1878,8 @@ body.select-mode .cell .fname {
 }
 
 .lb {
-  --lb-bar-safe: 118px;
+  /* Bar height + home-indicator; keep video controls above .lb-bar. */
+  --lb-bar-safe: calc(118px + env(safe-area-inset-bottom, 0px));
   display: flex;
   position: fixed;
   inset: 0;
@@ -1915,7 +1916,7 @@ body.select-mode .cell .fname {
 }
 .lb-bar {
   position: fixed;
-  bottom: max(20px, env(safe-area-inset-bottom));
+  bottom: max(20px, env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   display: grid;
@@ -1987,7 +1988,7 @@ body.select-mode .cell .fname {
 .lb-bar .lb-trash { color: #8f1d1d; }
 .lb-bar .lb-trash.busy { opacity: 0.55; pointer-events: none; }
 @media (max-width: 900px) {
-  .lb { --lb-bar-safe: 184px; }
+  .lb { --lb-bar-safe: calc(184px + env(safe-area-inset-bottom, 0px)); }
   .lb-bar { grid-template-columns: 1fr; align-items: stretch; }
   .lb-group { border-left: none; padding-left: 0; flex-wrap: wrap; }
 }
@@ -3174,8 +3175,8 @@ def _gallery_toolbar(file_count: int, star_count: int, context: str = 'normal',
     back_top = ''
     if paginated:
         back_top = (
-            '<button type="button" class="chip back-top" id="backTopBtn">'
-            '↑ 顶部</button>'
+            '<button type="button" class="chip back-top" id="backTopBtn" '
+            'aria-label="返回顶部">↑ 顶部</button>'
         )
     toolbar_actions = f'<div class="toolbar-actions">{back_top}</div>' if back_top else ''
     title_html = _esc(title or '图库')

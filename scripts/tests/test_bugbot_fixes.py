@@ -2791,6 +2791,10 @@ def test_large_gallery_month_groups_and_back_top():
             '<div class="toolbar">' in html
             and html.find('id="backTopBtn"') < html.find('<div class="sheet"'),
         )
+        check(
+            'back top keeps accessible label',
+            'aria-label="返回顶部"' in html and 'id="backTopBtn"' in html,
+        )
 
         page2 = wb.build_gallery_page_payload(
             work, thumbs, 'screenshots', offset=wb.GALLERY_PAGE_SIZE,
@@ -2836,8 +2840,16 @@ def test_lightbox_video_controls_not_covered_by_action_bar():
 
     check('lightbox has media container style', '.lb-media' in wb.PAGE_CSS)
     check('lightbox reserves bottom safe space', '--lb-bar-safe' in wb.PAGE_CSS)
+    check(
+        'lightbox safe space includes home indicator',
+        '--lb-bar-safe: calc(118px + env(safe-area-inset-bottom, 0px))' in wb.PAGE_CSS,
+    )
+    check(
+        'lightbox mobile safe space includes home indicator',
+        '--lb-bar-safe: calc(184px + env(safe-area-inset-bottom, 0px))' in wb.PAGE_CSS,
+    )
     check('lightbox media max-height uses safe space', 'calc(100vh - var(--lb-bar-safe))' in wb.PAGE_CSS)
-    check('lightbox action bar offset uses safe area', 'env(safe-area-inset-bottom)' in wb.PAGE_CSS)
+    check('lightbox action bar offset uses safe area', 'env(safe-area-inset-bottom' in wb.PAGE_CSS)
 
 
 def test_sticky_gallery_toolbar_title_stats_and_top_action():
@@ -2866,7 +2878,9 @@ def test_sticky_gallery_toolbar_title_stats_and_top_action():
         check(
             'toolbar has grouped back top action',
             'class="toolbar-actions"' in html
-            and '<button type="button" class="chip back-top" id="backTopBtn">↑ 顶部</button>' in html
+            and 'id="backTopBtn"' in html
+            and 'aria-label="返回顶部"' in html
+            and '↑ 顶部' in html
             and toolbar_pos < back_top_pos < sheet_pos,
             detail=f'{toolbar_pos}, {back_top_pos}, {sheet_pos}',
         )
