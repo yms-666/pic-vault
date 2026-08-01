@@ -2540,8 +2540,8 @@ def test_gallery_pagination():
     check('PAGE_JS has loadMoreGallery', 'function loadMoreGallery' in wb.PAGE_JS)
     check('PAGE_JS has /api/gallery', '/api/gallery' in wb.PAGE_JS)
     check(
-        'filter tip copy',
-        '先加载更多，再筛选' in wb._gallery_toolbar(1, 0, paginated=True),
+        'filter tip copy removed',
+        '先加载更多，再筛选' not in wb._gallery_toolbar(1, 0, paginated=True),
     )
     # Starred filter hides non-star cells (display:none), so #galleryMore stays in
     # viewport and IntersectionObserver would otherwise cascade-load the whole library.
@@ -2577,8 +2577,8 @@ def test_gallery_pagination():
             detail=f'cells={cell_n} page={wb.GALLERY_PAGE_SIZE} total={n}',
         )
         check('screenshots has load more', 'data-load-more' in html and '加载更多' in html)
-        check('screenshots has filter tip', '先加载更多，再筛选' in html)
-        check('screenshots count shows total', f'文件 {n}' in html)
+        check('screenshots hides filter tip', '先加载更多，再筛选' not in html)
+        check('screenshots count shows total', f'id="fileCount">{n}</span>' in html)
         # list_screenshots sorts by mtime desc → newest (n-1) on page 1; oldest (0) on last page
         check(
             'first page includes newest file',
@@ -2755,8 +2755,13 @@ def test_large_gallery_month_groups_and_back_top():
     print('\n30. Large gallery month groups and back-to-top')
 
     check('PAGE_JS sets up back top', 'function setupBackTop' in wb.PAGE_JS)
-    check('PAGE_JS toggles back top visibility', "classList.toggle('show'" in wb.PAGE_JS)
+    check('PAGE_JS scrolls to top', 'window.scrollTo({ top: 0' in wb.PAGE_JS)
     check('PAGE_JS updates month visibility', 'function updateGalleryMonthVisibility' in wb.PAGE_JS)
+    check('PAGE_JS can select a whole month group', 'function pickGalleryMonth' in wb.PAGE_JS)
+    check('month select button handled by click delegate', 'data-select-month' in wb.PAGE_JS)
+    check('month select detects loaded month boundary', 'function galleryMonthHasFollowingDivider' in wb.PAGE_JS)
+    check('month select loads until whole month is present', 'function ensureGalleryMonthLoaded' in wb.PAGE_JS and 'await ensureGalleryMonthLoaded(monthNode)' in wb.PAGE_JS)
+    check('load more reports whether it appended content', 'return true;' in wb.PAGE_JS and 'return false;' in wb.PAGE_JS)
 
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp) / 'work'
@@ -2777,20 +2782,18 @@ def test_large_gallery_month_groups_and_back_top():
 
         html = wb.render_screenshots(work, thumbs).decode('utf-8')
         check('large gallery has month divider', 'class="gallery-month"' in html)
+        check('month divider has batch select action', 'data-select-month="2026-07"' in html and '勾选本月' in html)
         check('large gallery shows July divider', '2026 年 7 月' in html)
         check('large gallery first page omits unloaded June divider', '2026 年 6 月' not in html)
-        check('large gallery has back top button', 'id="backTopBtn"' in html and '返回顶部' in html)
-        back_top_css = re.search(r'\.back-top \{(?P<body>.*?)\n\}', wb.PAGE_CSS, re.S)
-        back_top_body = back_top_css.group('body') if back_top_css else ''
+        check('large gallery has back top button', 'id="backTopBtn"' in html and '↑ 顶部' in html)
         check(
-            'back top floats above bottom paging area',
-            'top:' in back_top_body and 'bottom:' not in back_top_body,
-            detail=back_top_body.strip(),
+            'back top lives in sticky toolbar',
+            '<div class="toolbar">' in html
+            and html.find('id="backTopBtn"') < html.find('<div class="sheet"'),
         )
         check(
-            'back top stays under sticky toolbar z-index',
-            'z-index: 5' in back_top_body,
-            detail=back_top_body.strip(),
+            'back top keeps accessible label',
+            'aria-label="返回顶部"' in html and 'id="backTopBtn"' in html,
         )
 
         page2 = wb.build_gallery_page_payload(
@@ -2849,6 +2852,67 @@ def test_lightbox_video_controls_not_covered_by_action_bar():
     check('lightbox action bar offset uses safe area', 'env(safe-area-inset-bottom' in wb.PAGE_CSS)
 
 
+def test_sticky_gallery_toolbar_title_stats_and_top_action():
+    """Sticky gallery toolbar carries folder title, merged stats, top action, and no paging tip."""
+    print('\n32. Sticky gallery toolbar is compact and actionable')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / 'work'
+        thumbs = work / '_meta' / 'thumbs'
+        shots = work / 'screenshots'
+        thumbs.mkdir(parents=True)
+        shots.mkdir(parents=True)
+
+        for i in range(wb.GALLERY_PAGE_SIZE + 1):
+            name = f'screenshot_20260715_120000_{i:04x}.jpg'
+            (shots / name).write_bytes(b'x')
+
+        html = wb.render_screenshots(work, thumbs).decode('utf-8')
+        toolbar_pos = html.find('<div class="toolbar">')
+        sheet_pos = html.find('<div class="sheet"')
+        back_top_pos = html.find('id="backTopBtn"')
+        check('toolbar shows folder title only on left', 'toolbar-title' in html and '截图' in html)
+        check('toolbar moves file count into all chip', '全部<span class="n" id="fileCount">151</span>' in html)
+        check('toolbar keeps star count in starred chip', '仅加星<span class="n" id="starCount">0</span>' in html)
+        check('toolbar has no left stats block', 'toolbar-meta' not in html and 'pageMetaStars' not in html)
+        check(
+            'toolbar has grouped back top action',
+            'class="toolbar-actions"' in html
+            and 'id="backTopBtn"' in html
+            and 'aria-label="返回顶部"' in html
+            and '↑ 顶部' in html
+            and toolbar_pos < back_top_pos < sheet_pos,
+            detail=f'{toolbar_pos}, {back_top_pos}, {sheet_pos}',
+        )
+        check('toolbar separates filters and actions', html.find('toolbar-filters') < html.find('toolbar-actions') < html.find('toolbar-organize'))
+        check('toolbar no longer shows paging filter tip', '先加载更多，再筛选' not in html)
+        check('toolbar no longer uses old count block', 'class="count"' not in html)
+        check('review hint is outside sticky toolbar', 'toolbar"><p class="review-tip"' not in html and '<p class="review-tip">打开预览后按' in html)
+
+    check('desktop layout is wider for dense galleries', '.wrap { width: min(100%, 1360px);' in wb.PAGE_CSS)
+    check('desktop gallery uses denser thumbnail columns', 'repeat(auto-fill, minmax(184px, 1fr))' in wb.PAGE_CSS)
+    check('sticky toolbar is vertically compact', 'padding: 6px 0 7px;' in wb.PAGE_CSS)
+    check('toolbar has actions group css', '.toolbar-actions {' in wb.PAGE_CSS)
+    check('mobile filters scroll horizontally', '.toolbar-filters {' in wb.PAGE_CSS and 'overflow-x: auto;' in wb.PAGE_CSS)
+    check('month dividers have timeline tick', '.gallery-month::before' in wb.PAGE_CSS and 'border-left: 1px solid var(--line);' in wb.PAGE_CSS)
+    check('starred filter has one-time loaded-only toast', 'starredFilterHintShown' in wb.PAGE_JS and '仅筛选已加载内容' in wb.PAGE_JS)
+
+
+def test_lightbox_blank_area_click_closes_preview():
+    """Clicking lightbox blank space closes preview without closing on media/bar controls."""
+    print('\n33. Lightbox blank area closes preview')
+
+    check('PAGE_JS has blank close helper', 'function clickedLightboxBlank' in wb.PAGE_JS)
+    check('blank close accepts overlay', "classList.contains('lb')" in wb.PAGE_JS)
+    check('blank close accepts media backdrop', "classList.contains('lb-media')" in wb.PAGE_JS)
+    check('blank close excludes actual media', "closest('.lb-media img, .lb-media video')" in wb.PAGE_JS)
+    check('blank close excludes bottom bar', "closest('.lb-bar')" in wb.PAGE_JS)
+    check(
+        'blank close calls closeLightbox',
+        'clickedLightboxBlank(e.target)' in wb.PAGE_JS and 'closeLightbox();' in wb.PAGE_JS,
+    )
+
+
 def main():
     print('Bugbot fix regression checks')
     test_dashboard_pipeline_button()
@@ -2896,6 +2960,8 @@ def main():
     test_gallery_default_sort_by_capture_time_desc()
     test_large_gallery_month_groups_and_back_top()
     test_lightbox_video_controls_not_covered_by_action_bar()
+    test_sticky_gallery_toolbar_title_stats_and_top_action()
+    test_lightbox_blank_area_click_closes_preview()
     print(f'\n{passed} passed, {failed} failed')
     sys.exit(1 if failed else 0)
 
