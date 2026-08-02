@@ -42,24 +42,28 @@ def test(name):
     return deco
 
 
-def make_test_image(path: Path, exif_make=None, date='2024:07:15 14:30:12'):
-    """Create a minimal JPEG with given EXIF Make and date."""
+def make_test_image(path: Path, exif_make=None, date='2024:07:15 14:30:12',
+                    with_gps=True):
+    """Create a minimal JPEG with given EXIF Make and date.
+
+    When exif_make is set, GPS is included by default. Pass with_gps=False for
+    a camera photo that has Make but no location (v8 maker gate).
+    """
     from PIL import Image
     img = Image.new('RGB', (100, 100), color='blue')
     if exif_make:
-        from PIL.ExifTags import Base as ExifBase
         exif = img.getexif()
         exif[0x010F] = exif_make
         exif[0x9003] = date  # DateTimeOriginal
-        # GPS coordinates stored in degrees directly
-        from PIL.TiffImagePlugin import IFDRational
-        gps_ifd = {
-            1: 'N',  # GPSLatitudeRef
-            2: (IFDRational(34), IFDRational(0), IFDRational(0)),  # GPSLatitude
-            3: 'W',
-            4: (IFDRational(118), IFDRational(0), IFDRational(0)),  # GPSLongitude
-        }
-        exif[0x8825] = gps_ifd
+        if with_gps:
+            from PIL.TiffImagePlugin import IFDRational
+            gps_ifd = {
+                1: 'N',
+                2: (IFDRational(34), IFDRational(0), IFDRational(0)),
+                3: 'W',
+                4: (IFDRational(118), IFDRational(0), IFDRational(0)),
+            }
+            exif[0x8825] = gps_ifd
         img.save(str(path), 'JPEG', exif=exif.tobytes())
     else:
         img.save(str(path), 'JPEG')
@@ -420,6 +424,25 @@ def main():
             print(f"  ✗ FAIL: output: {out}")
     else:
         print(f"  ✗ FAIL: rc={rc}")
+
+    # v8: Make present, no GPS, non-camera filename → by-date (not screenshot)
+    shutil.rmtree(work / 'inbox', ignore_errors=True)
+    shutil.rmtree(work / 'by-date', ignore_errors=True)
+    shutil.rmtree(work / 'screenshots', ignore_errors=True)
+    (work / 'inbox').mkdir(exist_ok=True)
+    make_test_image(
+        inbox / 'vacation_raw.jpg', exif_make='SONY',
+        date='2023:10:29 15:03:34', with_gps=False,
+    )
+    rc, out, err = run([
+        'python3', str(SCRIPTS / 'rename_organize.py'),
+        '--work', str(work),
+        '--dry-run'
+    ])
+    if rc == 0 and 'by-date/' in out and 'screenshots/' not in out:
+        print("  ✓ Sony Make without GPS routed to by-date/ (v8)")
+    else:
+        print(f"  ✗ FAIL: Make-without-GPS: rc={rc} out={out}")
 
     # === Test 8: theme matching ===
     section("8. rename_organize.py - theme matching")

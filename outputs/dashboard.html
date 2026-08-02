@@ -2178,6 +2178,8 @@ function beginLiveOutput(cmdName) {
   const stdoutCard = document.getElementById('outputStdoutCard');
   const stderrCard = document.getElementById('outputStderrCard');
 
+  // Drop any unflushed lines from a previous run before resetting the panel.
+  clearLiveLineBuffers();
   const wasHidden = getComputedStyle(panel).display === 'none';
   setOutputHasData(true);
   meta.textContent = '运行中：' + new Date().toLocaleTimeString();
@@ -2195,23 +2197,61 @@ function beginLiveOutput(cmdName) {
   if (wasHidden) panel.scrollIntoView({behavior: 'smooth'});
 }
 
-function appendLiveLine(stream, line) {
-  const el = document.getElementById(stream === 'stderr' ? 'outputStderr' : 'outputStdout');
-  if (!el) return;
-  const card = el.closest('.output-card');
-  setOutputHasData(true);
-  if (el.style.display === 'none') el.style.display = 'block';
-  if (card) card.style.display = 'flex';
-  el.textContent += (el.textContent ? '\n' : '') + line;
-  const lines = el.textContent.split('\n');
-  if (lines.length > MAX_LIVE_LINES) {
-    el.textContent = '…（仅显示最近 ' + MAX_LIVE_LINES + ' 行，完整日志在 _meta/logs/runs/）\n' +
-      lines.slice(-MAX_LIVE_LINES).join('\n');
+// Batch live NDJSON lines onto the DOM so a chatty command cannot freeze the UI
+// (and back-pressure the fetch stream / server emit path).
+const _liveLineBuf = { stdout: [], stderr: [] };
+let _liveFlushTimer = null;
+
+function clearLiveLineBuffers() {
+  if (_liveFlushTimer != null) {
+    if (typeof cancelAnimationFrame === 'function') {
+      cancelAnimationFrame(_liveFlushTimer);
+    } else {
+      clearTimeout(_liveFlushTimer);
+    }
+    _liveFlushTimer = null;
   }
-  el.scrollTop = el.scrollHeight;
+  _liveLineBuf.stdout = [];
+  _liveLineBuf.stderr = [];
+}
+
+function flushLiveLineBuffers() {
+  _liveFlushTimer = null;
+  for (const stream of ['stdout', 'stderr']) {
+    const pending = _liveLineBuf[stream];
+    if (!pending.length) continue;
+    _liveLineBuf[stream] = [];
+    const el = document.getElementById(stream === 'stderr' ? 'outputStderr' : 'outputStdout');
+    if (!el) continue;
+    const card = el.closest('.output-card');
+    setOutputHasData(true);
+    if (el.style.display === 'none') el.style.display = 'block';
+    if (card) card.style.display = 'flex';
+    const chunk = pending.join('\n');
+    el.textContent += (el.textContent ? '\n' : '') + chunk;
+    const lines = el.textContent.split('\n');
+    if (lines.length > MAX_LIVE_LINES) {
+      el.textContent = '…（仅显示最近 ' + MAX_LIVE_LINES + ' 行，完整日志在 _meta/logs/runs/）\n' +
+        lines.slice(-MAX_LIVE_LINES).join('\n');
+    }
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+function appendLiveLine(stream, line) {
+  const key = stream === 'stderr' ? 'stderr' : 'stdout';
+  _liveLineBuf[key].push(line == null ? '' : String(line));
+  if (_liveFlushTimer != null) return;
+  if (typeof requestAnimationFrame === 'function') {
+    _liveFlushTimer = requestAnimationFrame(flushLiveLineBuffers);
+  } else {
+    _liveFlushTimer = setTimeout(flushLiveLineBuffers, 50);
+  }
 }
 
 function finishLiveOutput(data) {
+  // Flush any rAF-batched lines before painting the terminal status.
+  flushLiveLineBuffers();
   const meta = document.getElementById('outputMeta');
   const statusEl = document.getElementById('outputStatus');
   const cmdEl = document.getElementById('outputCmd');

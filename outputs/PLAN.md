@@ -4,7 +4,7 @@
 
 三盘架构 + 严格路径沙箱：工作盘 `/Volumes/Storage`（500G 机械）日常处理；备份盘 `/Volumes/WD4T/MediaVault/`（4T 机械）只接收 rsync 镜像；首次启动用 SSD `/Volumes/YM/MediaVault` 做迁移工作区。**脚本正式只读写这三个路径**；`/Users/ym/Downloads/pic-test` 仅用于自测。
 
-流水线：手动导入到 inbox → dedupe（SHA-256）→ rename_organize（by-date + screenshots + screenrecords，v7 分类）→ rsync 到 WD4T。精选走 `_favorite/` 真实复制 + AppleScript（`skip checking duplicates yes` + 打 favorite）。AppleScript 中带主题 → 相册名=主题名；无主题 → 相册名固定 `"Picks"`。iCloud Photos 已开启，AppleScript 跑完后自动同步到 iPhone。Vlog 推荐 iMovie。**首次迁移用户自行在 `/Volumes/YM/MediaVault/_pre_migration_backup/` 放好原始数据**，脚本只负责 stage → 处理 → rsync 回 WD4T。SD 卡格式化和工作盘清空人工完成。
+流水线：手动导入到 inbox → dedupe（SHA-256）→ rename_organize（by-date + screenshots + screenrecords，v8 分类）→ rsync 到 WD4T。精选走 `_favorite/` 真实复制 + AppleScript（`skip checking duplicates yes` + 打 favorite）。AppleScript 中带主题 → 相册名=主题名；无主题 → 相册名固定 `"Picks"`。iCloud Photos 已开启，AppleScript 跑完后自动同步到 iPhone。Vlog 推荐 iMovie。**首次迁移用户自行在 `/Volumes/YM/MediaVault/_pre_migration_backup/` 放好原始数据**，脚本只负责 stage → 处理 → rsync 回 WD4T。SD 卡格式化和工作盘清空人工完成。
 
 ## 路径沙箱
 
@@ -45,8 +45,8 @@ flowchart TB
     WT["_trash / 30天"]
     WM["_meta"]
     WI -->|"dedupe +<br/>rename_organize"| WB
-    WI -->|"v7 截图"| WS
-    WI -->|"v7 录屏"| WR
+    WI -->|"v8 截图"| WS
+    WI -->|"v8 录屏"| WR
     WB -->|"pick_to_iphone"| WF
     WB -->|"vlog 导出"| WV
     WI -. "副本" .-> WT
@@ -285,20 +285,21 @@ iPhone Favorites、Android 相册星标都在系统相册数据库，不在照�
 
 源白名单：`iphone` `samsung` `xiaomi` `huawei` `oppo` `vivo` `oneplus` `google` `canon` `canon-a/b` `nikon` `nikon-a` `sony` `sony-a` `fuji` `fuji-a` `ricoh-gr` `ricoh-gr2` `dji` `dji-nano/action/pocket/osmo` `gopro`
 
-Live Photo（同目录同名 HEIC/JPG + MOV）成对进 `by-date/.../photos/`，共用 stem `<date>_<source>_live_<hash>`（无 source 则为 `<date>_live_<hash>`）；Web 画廊只展示静图。单边仍按普通规则。截图/录屏分类见下文「截图/录屏检测（v7）」。
+Live Photo（同目录同名 HEIC/JPG + MOV）成对进 `by-date/.../photos/`，共用 stem `<date>_<source>_live_<hash>`（无 source 则为 `<date>_live_<hash>`）；Web 画廊只展示静图。单边仍按普通规则。截图/录屏分类见下文「截图/录屏检测（v8）」。
 
-## 截图/录屏检测（v7）
+## 截图/录屏检测（v8）
 
-截图与录屏分两桶；相机文件名白名单优先保真。
+截图与录屏分两桶；相机文件名白名单与 maker 证据优先保真。
 
 ### 判定顺序
 
 0. **`is_camera_filename`**（`IMG_` / `VID_` / `DJI_` / `GOPR` / …）→ **normal** → `by-date/`
 
 **图片**（非视频）：
-1. 文件名含 `screenshot` → `screenshots/`
-2. **无 EXIF GPS** → `screenshots/`
-3. 否则 → `by-date/`
+1. **Maker 证据**（EXIF Make，或归档文件名中的白名单 source，如 `screenshot_…_sony_…`）→ `by-date/`
+2. 文件名含 `screenshot` → `screenshots/`
+3. **无 EXIF GPS** → `screenshots/`
+4. 否则 → `by-date/`
 
 **视频**：
 1. 文件名含 `record`（子串，覆盖 Screen Recording / Screenrecorder 等）→ `screenrecords/`
@@ -306,6 +307,7 @@ Live Photo（同目录同名 HEIC/JPG + MOV）成对进 `by-date/.../photos/`，
 3. 否则 → `by-date/`
 
 > iOS `RPReplay_Final_*.mov` 不含 `record`，靠规则 2（无元数据）进 `screenrecords/`。
+> 存量误归：`rename_organize.py --fix-maker-screenshots [--dry-run]` 将 `screenshots/` 中有 maker 证据的文件移回 `by-date/`。
 
 ### 命名与落盘
 
@@ -317,12 +319,13 @@ Live Photo（同目录同名 HEIC/JPG + MOV）成对进 `by-date/.../photos/`，
 | things（仅手动） | `things/` | `things_<date>_<source?>_<hash>.ext` |
 | normal | `by-date/...` | `<date>_<source?>_<hash>.ext` |
 
-### 命名示例（v7）
+### 命名示例（v8）
 
 | 原始文件名 | 来源 | 走哪 |
 |---|---|---|
 | `Screenshot_2026-07-15_18-30-22.png` | Android 截图 | `screenshots/` |
-| 无 GPS 的微信/小红书 JPG（非相机名） | 社交另存 | `screenshots/` |
+| 无 GPS 但有 EXIF Make 的相机 JPG | 相机（关定位） | `by-date/photos/`（v8 maker）|
+| 无 GPS 的微信/小红书 JPG（非相机名、无 Make） | 社交另存 | `screenshots/` |
 | `Screen Recording 2026-07-15.mov` | macOS | `screenrecords/`（含 record）|
 | `Screenrecorder_20260715.mp4` | Android | `screenrecords/` |
 | `RPReplay_Final_1689496200.mov` | iOS 录屏 | `screenrecords/`（无 Make/GPS）|
@@ -391,7 +394,7 @@ POST /api/star
 | 场景 | 行为 |
 |---|---|
 | 相机文件名白名单 | 强制 by-date |
-| 无 GPS 社交图 | screenshots/（符合 v7）|
+| 无 GPS 社交图（无 Make） | screenshots/（符合 v8）|
 | 元数据被剥的真照片（非相机名） | 可能进 screenshots/ → Web「移回普通分类」|
 | 已归档存量 | 不会自动重扫；用 Web 勾选纠错 |
 
@@ -476,7 +479,7 @@ cp -r /Volumes/WD4T/MediaVault/2025 /Volumes/YM/MediaVault/_pre_migration_backup
 |---|---|
 | `init_storage.sh` | 在指定根目录创建顶层目录骨架（含 `screenshots/` `screenrecords/`） |
 | `dedupe.py` | SHA-256 精确去重；源从 EXIF/`.source`/`--source` 三层识别；重复文件入 `_trash/` |
-| `rename_organize.py` | 重命名 + 归档；v7：by-date / screenshots / screenrecords |
+| `rename_organize.py` | 重命名 + 归档；v8：by-date / screenshots / screenrecords |
 | `add_theme.py` | 交互式追加主题到 events.yaml |
 | `onboard_migrate.sh` | 把 `_pre_migration_backup/` 内容 stage 到 `working/inbox/`；不动 `_pre_migration_backup/` 本身 |
 | `sync_to_backup.sh` | rsync 工作盘 → 备份盘（白名单含 screenrecords；默认 append-only） |
@@ -733,7 +736,7 @@ osascript /Volumes/Storage/_meta/scripts/favorite-2026-08.scpt
 | 去重 v1 | 仅精确 SHA-256 |
 | 文件夹结构 | 月份默认桶 + 主题旁挂桶（平级） |
 | 命名格式 | `YYYYMMDD_HHMMSS_<source>_<4hash>.ext`；source 不可识别时省略 |
-| 截图/录屏检测 | **v7**：相机文件名白名单优先；图含 `screenshot` 或无 GPS → `screenshots/`；视频含 `record` 或（无 Make∨无 GPS）→ `screenrecords/` |
+| 截图/录屏检测 | **v8**：相机文件名 / maker 证据优先；否则图含 `screenshot` 或无 GPS → `screenshots/`；视频含 `record` 或（无 Make∨无 GPS）→ `screenrecords/` |
 | 文件名关键字 | 图：`screenshot`；视频：`record`（子串）|
 | 命名 | 截图 `screenshot_…`；录屏 `screenrecorder_…`；普通仍无日期模板 |
 | 录屏视频 | 进 `screenrecords/`（与截图分桶）|
@@ -771,10 +774,11 @@ osascript /Volumes/Storage/_meta/scripts/favorite-2026-08.scpt
 - `dedupe.py`：5 对重复 → 识别 5 对
 - `dedupe.py` 源识别：iPhone/Canon/DJI/CLI/省略各路径
 - `rename_organize.py`：30 文件 + 主题 → 18+12；幂等
-- `rename_organize.py` 截图/录屏检测（v7）：
-  - **截图 → screenshots/**：`Screenshot_….png`；无 GPS 的非相机名 JPG/PNG
+- `rename_organize.py` 截图/录屏检测（v8）：
+  - **截图 → screenshots/**：`Screenshot_….png`；无 GPS 且无 Make 的非相机名 JPG/PNG
   - **录屏 → screenrecords/**：含 `record` 的视频；`RPReplay_*.mov`（无元数据）；无 Make/GPS 的普通视频
-  - **仍进 by-date**：`VID_…` / `IMG_…` 等相机文件名；有完整 Make+GPS 的视频
+  - **仍进 by-date**：`VID_…` / `IMG_…` 等相机文件名；有 EXIF Make 的图片（即使无 GPS）；有完整 Make+GPS 的视频
+  - **存量纠错**：`--fix-maker-screenshots` 将 `screenshots/` 中带 Make / 白名单 source 的文件移回 `by-date/`
   - **跳过非媒体**：HTML、PDF、TXT 等不是照片/视频的文件留在 `inbox/`
   - 命名：截图 `screenshot_`、录屏 `screenrecorder_`
   - `reclassify_paths(to_screen|to_normal)` 双向纠错

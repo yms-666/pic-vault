@@ -191,11 +191,13 @@ inbox/
 # 1) 扫 inbox/：重命名 + 分桶（可为空）
 # 2) 不再自动全量同步主题（避免冲掉各主题桶手工调整）
 #    主题生效：picvault theme rebucket --theme <名> [--yes]
-# 截图/录屏检测（v7）：
+# 截图/录屏检测（v8）：
 #   0. 已知相机文件名（IMG_/VID_/DJI_/…）→ by-date/（normal）
-#   图片：含 screenshot → screenshots/；无 GPS → screenshots/
+#   图片：有 Make 或归档白名单 source → by-date/；
+#         否则含 screenshot → screenshots/；无 GPS → screenshots/
 #   视频：含 record → screenrecords/；（无 Make 或 无 GPS）→ screenrecords/
 #   非图片/视频（如 HTML、PDF、TXT）→ 跳过，留在 inbox/
+#   存量：--fix-maker-screenshots 将 screenshots/ 中有 maker 的文件移回 by-date/
 # 其他照片 → by-date/<YYYY-MM>/photos/；视频 → videos/
 # 主题文件进 2026-MM_<theme>/，无主题文件进 2026-MM/
 ```
@@ -211,7 +213,8 @@ inbox/
 
 > **示例**：
 > - `Screenshot_….png` → 关键字 → `screenshots/`
-> - 无 GPS 的微信/小红书 JPG（非相机名）→ `screenshots/`
+> - 有 EXIF Make 的相机图（即使无 GPS）→ `by-date/`
+> - 无 GPS 的微信/小红书 JPG（非相机名、无 Make）→ `screenshots/`
 > - Android `Screenrecorder_….mp4` → 含 `record` → `screenrecords/`
 > - iOS `RPReplay_Final_….mov`（无 Make/GPS）→ `screenrecords/`
 > - `VID_….mp4` / `IMG_….HEIC`（相机文件名白名单）→ `by-date/`

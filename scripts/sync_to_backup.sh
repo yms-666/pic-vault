@@ -19,6 +19,8 @@ DRY_RUN=""
 VERIFY=""
 PRUNE=""
 CONFIRM=""
+# CLI default: verbose file list (-avh). Dashboard passes --progress for quiet.
+RSYNC_MODE="verbose"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -28,13 +30,18 @@ while [[ $# -gt 0 ]]; do
         --verify) VERIFY="verify"; shift ;;
         --prune) PRUNE="prune"; shift ;;
         --confirm) CONFIRM="yes"; shift ;;
+        --verbose|-v) RSYNC_MODE="verbose"; shift ;;
+        --progress) RSYNC_MODE="progress"; shift ;;
         -h|--help)
             cat << 'USAGE'
-Usage: sync_to_backup.sh [--work PATH] [--backup PATH] [--dry-run] [--verify] [--prune --confirm]
+Usage: sync_to_backup.sh [--work PATH] [--backup PATH] [--dry-run] [--verify]
+                         [--progress] [--verbose] [--prune --confirm]
 
 Modes:
   (default)     Append-only mirror: only adds new files to backup, never deletes.
   --verify      After a real mirror, verify with size/mtime (skipped under --dry-run).
+  --progress    Quiet transfer (-ah, no per-file list); for dashboard / large trees.
+  --verbose     List every transferred path (-avh). Default for CLI.
   --prune       DANGEROUS: also delete files from backup that are not on work disk.
                 Requires --confirm to actually run.
 
@@ -43,6 +50,7 @@ Examples:
   sync_to_backup.sh --dry-run          # preview what would be mirrored
   sync_to_backup.sh --verify           # mirror + verify
   sync_to_backup.sh --verify --dry-run # preview only; verify is skipped
+  sync_to_backup.sh --progress         # quiet (dashboard default)
   sync_to_backup.sh --prune --confirm  # mirror + delete orphans on backup
 USAGE
             exit 0 ;;
@@ -112,9 +120,17 @@ if [[ -z "$DRY_RUN" ]]; then
 fi
 
 # Build rsync args
-# Include only specific subdirs to avoid touching backup root's other content
+# Include only specific subdirs to avoid touching backup root's other content.
+# --progress (dashboard): -ah only. openrsync's --progress still prints every
+# path and floods the web control-plane pipe; stay truly quiet here.
+# Default/--verbose: -avh (full file list for CLI debugging).
+if [[ "$RSYNC_MODE" == "progress" ]]; then
+    RSYNC_FLAGS=(-ah)
+else
+    RSYNC_FLAGS=(-avh)
+fi
 RSYNC_ARGS=(
-    -avh $DRY_RUN
+    "${RSYNC_FLAGS[@]}" $DRY_RUN
     --include='by-date/***'
     --include='screenshots/***'
     --include='screenrecords/***'
@@ -146,10 +162,17 @@ fi
 # Mirror
 echo "→ Mirroring $WORK -> $BACKUP"
 echo "  Including: by-date/, screenshots/, screenrecords/, docs/, things/, _favorite/, _vlogs/"
+if [[ "$RSYNC_MODE" == "progress" ]]; then
+    echo "  Mode: quiet (-ah$( [[ -n "$DRY_RUN" ]] && echo " -n" )); per-file list suppressed for control-plane stability"
+else
+    echo "  Mode: verbose (-avh$( [[ -n "$DRY_RUN" ]] && echo " -n" ))"
+fi
+echo "→ rsync starting…"
 rsync "${RSYNC_ARGS[@]}" "$WORK/" "$BACKUP/" || {
     echo "ERROR: rsync failed" >&2
     exit 1
 }
+echo "→ rsync finished"
 
 # Optional verify (skip when --dry-run: nothing was written, size/mtime compare
 # against an unchanged backup is meaningless)

@@ -19,6 +19,7 @@ import queue
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -33,6 +34,11 @@ ALLOWED_WORK_PREFIXES = ('/Volumes/Storage', '/Volumes/YM/MediaVault', '/Users/y
 ALLOWED_BACKUP_PREFIXES = ('/Volumes/WD4T/MediaVault', '/Volumes/YM/MediaVault')
 THUMB_CACHE = '_meta/thumbs'
 VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp', '.hevc', '.webm'}
+# Formats <img> can usually decode natively. Others (HEIC/RAW/…) need a JPEG preview
+# for lightbox; grid thumbs already go through sips → JPEG.
+BROWSER_NATIVE_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.avif'}
+THUMB_SIZE = 320
+PREVIEW_SIZE = 2048
 RUN_TIMEOUT_SEC = None  # 不超时；长任务实质不限时
 # 仅当 RUN_TIMEOUT_SEC 为 None 时作为极长兜底；再设为 None 则完全无限
 RUN_HARD_CAP_SEC = 7 * 24 * 3600
@@ -141,6 +147,60 @@ _ACTIVE_PROC = None  # subprocess.Popen or None
 _CANCEL_REQUESTED = False
 
 _RUN_ID_RE = re.compile(r'^[\w\-]+$')
+# Live NDJSON: always emit early stdout, then sample; never let the browser
+# back-pressure block draining the child pipes (see run-stream-stall design).
+LIVE_STDOUT_HEAD = 40
+LIVE_STDOUT_EVERY = 100
+# Short socket timeout so a slow/stuck dashboard cannot freeze pipe drain.
+NDJSON_EMIT_TIMEOUT_SEC = 0.2
+_TERMINAL_RUN_STATUSES = frozenset(('ok', 'error', 'cancelled'))
+
+
+def terminate_run_process(proc) -> None:
+    """Terminate a Popen started with start_new_session=True (kill process group)."""
+    if proc is None or proc.poll() is not None:
+        return
+    pid = proc.pid
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=3)
+        return
+    except Exception:
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def should_live_emit_stdout(line_no: int, text: str) -> bool:
+    """Whether a stdout line should be pushed live (log always keeps every line)."""
+    if line_no <= LIVE_STDOUT_HEAD:
+        return True
+    if line_no % LIVE_STDOUT_EVERY == 0:
+        return True
+    s = text.lstrip()
+    if s.startswith('→') or s.startswith('✓') or s.startswith('ERROR'):
+        return True
+    if 'total size' in text or 'Transfer starting' in text or 'Skipping verify' in text:
+        return True
+    # rsync --progress style leftovers
+    if '%' in text and ('to-check' in text or 'bytes/sec' in text or '/s' in text):
+        return True
+    return False
 
 
 def runs_dir(work: Path) -> Path:
@@ -379,7 +439,15 @@ def _is_jpeg_bytes(path: Path) -> bool:
         return False
 
 
-def gen_thumbnail(src: Path, dst: Path, size=320) -> bool:
+def needs_jpeg_preview(path: Path) -> bool:
+    """True when lightbox should serve a JPEG stand-in instead of /raw."""
+    ext = path.suffix.lower()
+    if ext in VIDEO_EXTS:
+        return False
+    return ext not in BROWSER_NATIVE_IMAGE_EXTS
+
+
+def gen_thumbnail(src: Path, dst: Path, size=THUMB_SIZE) -> bool:
     """Generate thumbnail: sips for images, ffmpeg frame extract for videos.
 
     Always write real JPEG bytes to dst (.jpg). Plain ``sips -Z`` keeps the
@@ -449,8 +517,27 @@ def thumb_for(file_path: Path, work: Path, thumb_root: Path) -> Path:
             thumb_path.unlink()
         except OSError:
             pass
-    if gen_thumbnail(file_path, thumb_path):
+    if gen_thumbnail(file_path, thumb_path, size=THUMB_SIZE):
         return thumb_path
+    return None
+
+
+def preview_for(file_path: Path, work: Path, thumb_root: Path) -> Path:
+    """Larger JPEG for lightbox when the browser cannot decode the original.
+
+    Cached as ``<rel>.preview.jpg`` under thumb_root (alongside grid thumbs).
+    """
+    rel = file_path.resolve().relative_to(work.resolve())
+    preview_path = thumb_root / rel.with_suffix('.preview.jpg')
+    if preview_path.exists():
+        if _is_jpeg_bytes(preview_path):
+            return preview_path
+        try:
+            preview_path.unlink()
+        except OSError:
+            pass
+    if gen_thumbnail(file_path, preview_path, size=PREVIEW_SIZE):
+        return preview_path
     return None
 
 
@@ -2902,6 +2989,7 @@ PAGE_JS = '''
   var lb = null;
   function openLightbox(el) {
     var src = el.getAttribute('data-lightbox');
+    var rawHref = el.getAttribute('data-raw') || src;
     var path = el.getAttribute('data-path') || '';
     var bucket = el.getAttribute('data-bucket') || '';
     var name = el.getAttribute('data-name') || '';
@@ -2948,7 +3036,7 @@ PAGE_JS = '''
       posEl.textContent = items.length ? ('第 ' + (pos + 1) + ' 项｜共 ' + items.length + ' 项') : '';
     }
     var raw = lb.querySelector('.open-raw');
-    raw.href = src;
+    raw.href = rawHref;
     syncLightboxPick(path);
     var starBtn = lb.querySelector('.star-lb');
     starBtn.setAttribute('data-path', path);
@@ -3097,11 +3185,18 @@ def _media_cell(f: Path, work: Path, thumb_root: Path, bucket: str,
     q = urllib.parse.quote(rel)
     raw_url = f'/raw?p={q}'
     thumb_url = f'/thumb?p={q}'
+    # HEIC/RAW etc. cannot be decoded by most browsers' <img>; use /preview JPEG.
+    # "查看原图" still opens /raw via data-raw.
+    if (not is_video) and needs_jpeg_preview(f):
+        lightbox_url = f'/preview?p={q}'
+    else:
+        lightbox_url = raw_url
     # Grid always uses <img> + /thumb (videos: ffmpeg frame). Click opens lightbox;
     # do not embed <video src=/raw> in the sheet (breaks preview / hammers Range).
     media = (
         f'<img class="thumb" src="{_esc(thumb_url)}" alt="{_esc(f.name)}" '
-        f'loading="lazy" data-lightbox="{_esc(raw_url)}" '
+        f'loading="lazy" data-lightbox="{_esc(lightbox_url)}" '
+        f'data-raw="{_esc(raw_url)}" '
         f'data-path="{_esc(rel)}" data-bucket="{_esc(bucket)}" '
         f'data-name="{_esc(f.name)}" data-video="{"1" if is_video else "0"}">'
     )
@@ -4202,6 +4297,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/thumb':
                 p = qs.get('p', [''])[0]
                 self._send_thumb(p)
+            elif path == '/preview':
+                p = qs.get('p', [''])[0]
+                self._send_preview(p)
             elif path == '/api/star':
                 self._handle_star_api(qs)
             elif path == '/api/gallery':
@@ -4427,65 +4525,110 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _emit_ndjson(self, obj):
-        """Write one NDJSON event. Returns False if the client is gone."""
+        """Write one NDJSON event. Returns False if the client is gone/too slow.
+
+        Uses a short socket timeout so a stalled dashboard cannot block the
+        handler thread (and thereby stall child-pipe drain / rsync).
+        """
+        sock = getattr(self, 'connection', None) or getattr(self, 'request', None)
+        old_timeout = None
         try:
+            if sock is not None:
+                try:
+                    old_timeout = sock.gettimeout()
+                    sock.settimeout(NDJSON_EMIT_TIMEOUT_SEC)
+                except Exception:
+                    old_timeout = None
             line = (json.dumps(obj, ensure_ascii=False) + '\n').encode('utf-8')
             self.wfile.write(line)
             self.wfile.flush()
             return True
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                TimeoutError, socket.timeout, OSError):
             return False
+        finally:
+            if sock is not None and old_timeout is not None:
+                try:
+                    sock.settimeout(old_timeout)
+                except Exception:
+                    pass
 
-    def _finish_run_meta(self, meta: dict, status: str, rc=None, error=None):
+    def _finish_run_meta(self, meta: dict, status: str, rc=None, error=None,
+                         clear_active: bool = True):
+        """Persist terminal run status. Idempotent if already finalized.
+
+        ``clear_active=False`` updates disk/meta but keeps the in-memory slot so
+        a cancelled stream can finish draining before another /api/run starts.
+        """
         global _ACTIVE_RUN, _ACTIVE_PROC, _CANCEL_REQUESTED
-        meta['finished_at'] = datetime.now().isoformat(timespec='seconds')
-        meta['status'] = status
-        meta['rc'] = rc
-        meta['error'] = error
-        persist_run_meta(self.work, meta)
         with _RUN_LOCK:
-            if _ACTIVE_RUN and _ACTIVE_RUN.get('id') == meta['id']:
+            if meta.get('status') in _TERMINAL_RUN_STATUSES and meta.get('finished_at'):
+                if clear_active:
+                    if _ACTIVE_RUN and _ACTIVE_RUN.get('id') == meta['id']:
+                        _ACTIVE_RUN = None
+                    _ACTIVE_PROC = None
+                    _CANCEL_REQUESTED = False
+                return
+            meta['finished_at'] = datetime.now().isoformat(timespec='seconds')
+            meta['status'] = status
+            meta['rc'] = rc
+            meta['error'] = error
+            persist_run_meta(self.work, meta)
+            if clear_active:
+                if _ACTIVE_RUN and _ACTIVE_RUN.get('id') == meta['id']:
+                    _ACTIVE_RUN = None
+                _ACTIVE_PROC = None
+                _CANCEL_REQUESTED = False
+
+    def _clear_active_run_slot(self, run_id: str):
+        """Release mutex after the streaming handler fully exits."""
+        global _ACTIVE_RUN, _ACTIVE_PROC, _CANCEL_REQUESTED
+        with _RUN_LOCK:
+            if _ACTIVE_RUN and _ACTIVE_RUN.get('id') == run_id:
                 _ACTIVE_RUN = None
             _ACTIVE_PROC = None
             _CANCEL_REQUESTED = False
 
     def _cancel_active_run(self):
-        """POST /api/runs/cancel — terminate the active /api/run subprocess."""
-        global _CANCEL_REQUESTED
+        """POST /api/runs/cancel — kill process group and mark run cancelled.
+
+        Keeps ``_ACTIVE_RUN`` until ``_run_streaming`` exits so a new /api/run
+        cannot overlap while pipes are still draining.
+        """
+        global _CANCEL_REQUESTED, _ACTIVE_PROC
         with _RUN_LOCK:
-            meta = dict(_ACTIVE_RUN) if _ACTIVE_RUN else None
+            live = _ACTIVE_RUN
+            meta_snap = dict(live) if live else None
             proc = _ACTIVE_PROC
-            running = bool(meta and meta.get('status') == 'running')
+            running = bool(live and live.get('status') == 'running')
             if running:
                 _CANCEL_REQUESTED = True
         if not running:
             self._send_json({'ok': False, 'error': '没有运行中的任务'})
             return
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=3)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+        terminate_run_process(proc)
+        rc = proc.returncode if proc is not None else None
+        target = live if live is not None else meta_snap
+        if target is not None:
+            self._finish_run_meta(
+                target, 'cancelled', rc=rc, error='已打断', clear_active=False,
+            )
+            with _RUN_LOCK:
+                # Process is dead; keep meta slot for drain mutex only.
+                _ACTIVE_PROC = None
         self._send_json({
             'ok': True,
             'cancelled': True,
-            'run_id': meta.get('id') if meta else None,
-            'command_name': meta.get('command_name') if meta else None,
+            'run_id': meta_snap.get('id') if meta_snap else None,
+            'command_name': meta_snap.get('command_name') if meta_snap else None,
         })
 
     def _run_streaming(self, argv, cmd_str: str, cmd_name: str, backup: str = None):
         """Run argv, stream NDJSON, and persist to _meta/logs/runs/.
 
-        Client disconnect does not kill the subprocess — output keeps going to
-        the log file so the dashboard can resume via /api/runs/<id>/log.
-        Use POST /api/runs/cancel to terminate an active run.
+        Log writes happen on reader threads (never blocked by the browser).
+        Live NDJSON is best-effort + sampled for stdout. Client disconnect or
+        slow consumers do not kill the subprocess — use POST /api/runs/cancel.
         """
         global _ACTIVE_RUN, _ACTIVE_PROC, _CANCEL_REQUESTED
 
@@ -4493,11 +4636,14 @@ class Handler(BaseHTTPRequestHandler):
             backup = BACKUP_DEFAULT
 
         with _RUN_LOCK:
-            if _ACTIVE_RUN is not None and _ACTIVE_RUN.get('status') == 'running':
+            # Reject while a stream handler still owns the slot (including
+            # cancelled-but-draining), not only status==running.
+            if _ACTIVE_RUN is not None or (
+                    _ACTIVE_PROC is not None and _ACTIVE_PROC.poll() is None):
                 self._send_json({
                     'ok': False,
-                    'error': '已有任务在运行',
-                    'active': dict(_ACTIVE_RUN),
+                    'error': '已有任务在运行或收尾中',
+                    'active': dict(_ACTIVE_RUN) if _ACTIVE_RUN else None,
                 })
                 return
             run_id = make_run_id(cmd_name)
@@ -4515,23 +4661,44 @@ class Handler(BaseHTTPRequestHandler):
             }
             runs_dir(self.work).mkdir(parents=True, exist_ok=True)
             persist_run_meta(self.work, meta)
-            _ACTIVE_RUN = dict(meta)
+            _ACTIVE_RUN = meta  # same dict object so cancel can finalize it
             _CANCEL_REQUESTED = False
             _ACTIVE_PROC = None
 
         log_path = self.work / log_rel
         log_fp = None
+        log_lock = threading.Lock()
+        log_pending = 0
         started = False
         proc = None
         client_ok = True
         finalized = False
+        stdout_line_no = 0
 
-        def append_log(stream: str, text: str):
+        def append_log(stream: str, text: str, force_flush: bool = False):
+            """Persist a line. Flush in batches — per-line flush can stall readers
+            on slow volumes and re-fill the child stdout pipe (rsync deadlock)."""
+            nonlocal log_pending
             if log_fp is None:
                 return
             try:
-                log_fp.write(f'[{stream}] {text}\n')
-                log_fp.flush()
+                with log_lock:
+                    log_fp.write(f'[{stream}] {text}\n')
+                    log_pending += 1
+                    if force_flush or log_pending >= 64:
+                        log_fp.flush()
+                        log_pending = 0
+            except Exception:
+                pass
+
+        def flush_log():
+            nonlocal log_pending
+            if log_fp is None:
+                return
+            try:
+                with log_lock:
+                    log_fp.flush()
+                    log_pending = 0
             except Exception:
                 pass
 
@@ -4550,6 +4717,7 @@ class Handler(BaseHTTPRequestHandler):
                     stderr=subprocess.PIPE,
                     text=True,
                     bufsize=1,
+                    start_new_session=True,
                     # WORK/BACKUP must match this server / dashboard so CLI helpers
                     # (web stop, pipeline sync) hit the same disks (env beats config).
                     env={
@@ -4588,12 +4756,16 @@ class Handler(BaseHTTPRequestHandler):
                 q = queue.Queue()
 
                 def _reader(stream, event_type):
+                    """Drain pipe → log (always) → emit queue (live UI)."""
                     try:
                         for line in stream:
-                            q.put((event_type, line.rstrip('\n')))
+                            text = line.rstrip('\n').rstrip('\r')
+                            append_log(event_type, text)
+                            q.put((event_type, text))
                     except Exception:
                         pass
                     finally:
+                        flush_log()
                         q.put((None, event_type))
 
                 t_out = threading.Thread(target=_reader, args=(proc.stdout, 'stdout'), daemon=True)
@@ -4606,7 +4778,23 @@ class Handler(BaseHTTPRequestHandler):
                 done = {'stdout': False, 'stderr': False}
                 timed_out = False
 
+                def _handle_event(kind, payload):
+                    nonlocal stdout_line_no
+                    if kind is None:
+                        done[payload] = True
+                        return
+                    if kind == 'stderr':
+                        emit({'type': 'stderr', 'line': payload})
+                        return
+                    stdout_line_no += 1
+                    if should_live_emit_stdout(stdout_line_no, payload):
+                        emit({'type': 'stdout', 'line': payload})
+
                 while not (done['stdout'] and done['stderr']):
+                    # Cancel may finalize meta from another thread; stop emitting.
+                    if meta.get('status') in _TERMINAL_RUN_STATUSES:
+                        # Keep draining so pipes empty and process can exit.
+                        pass
                     if deadline is not None:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
@@ -4624,36 +4812,19 @@ class Handler(BaseHTTPRequestHandler):
                                     kind, payload = q.get_nowait()
                                 except queue.Empty:
                                     break
-                                if kind is None:
-                                    done[payload] = True
-                                else:
-                                    append_log(kind, payload)
-                                    emit({'type': kind, 'line': payload})
+                                _handle_event(kind, payload)
                             break
                         continue
-                    if kind is None:
-                        done[payload] = True
-                    else:
-                        append_log(kind, payload)
-                        emit({'type': kind, 'line': payload})
+                    _handle_event(kind, payload)
 
                 if timed_out:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    try:
-                        proc.wait(timeout=5)
-                    except Exception:
-                        pass
+                    terminate_run_process(proc)
                     while True:
                         try:
                             kind, payload = q.get_nowait()
                         except queue.Empty:
                             break
-                        if kind is not None:
-                            append_log(kind, payload)
-                            emit({'type': kind, 'line': payload})
+                        _handle_event(kind, payload)
                     err = f'timeout ({timeout_sec}s)'
                     emit({
                         'type': 'error',
@@ -4672,11 +4843,9 @@ class Handler(BaseHTTPRequestHandler):
                             kind, payload = q.get_nowait()
                         except queue.Empty:
                             break
-                        if kind is not None:
-                            append_log(kind, payload)
-                            emit({'type': kind, 'line': payload})
+                        _handle_event(kind, payload)
                     with _RUN_LOCK:
-                        cancelled = _CANCEL_REQUESTED
+                        cancelled = _CANCEL_REQUESTED or meta.get('status') == 'cancelled'
                     if cancelled:
                         err = '已打断'
                         append_log('stderr', err)
@@ -4716,37 +4885,27 @@ class Handler(BaseHTTPRequestHandler):
                         'error': str(e),
                         'run_id': run_id,
                     })
-                if proc is not None and proc.poll() is None:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
+                terminate_run_process(proc)
                 self._finish_run_meta(meta, 'error', rc=None, error=str(e))
                 finalized = True
         finally:
+            flush_log()
             if log_fp is not None:
                 try:
                     log_fp.close()
                 except Exception:
                     pass
             if not finalized:
-                # Unexpected exit without finalize — mark error & clear active
-                with _RUN_LOCK:
-                    if _ACTIVE_RUN and _ACTIVE_RUN.get('id') == run_id:
-                        meta['finished_at'] = datetime.now().isoformat(timespec='seconds')
-                        meta['status'] = 'error'
-                        meta['error'] = meta.get('error') or 'aborted'
-                        persist_run_meta(self.work, meta)
-                        _ACTIVE_RUN = None
-                        if proc is not None and proc.poll() is None:
-                            try:
-                                proc.kill()
-                            except Exception:
-                                pass
-            else:
-                with _RUN_LOCK:
-                    if _ACTIVE_RUN and _ACTIVE_RUN.get('id') == run_id:
-                        _ACTIVE_RUN = None
+                terminate_run_process(proc)
+                if meta.get('status') not in _TERMINAL_RUN_STATUSES:
+                    self._finish_run_meta(
+                        meta, 'error', rc=None,
+                        error=meta.get('error') or 'aborted',
+                        clear_active=False,
+                    )
+            # Always release the slot here so cancel's clear_active=False cannot
+            # leave a drained run blocking /api/run forever.
+            self._clear_active_run_slot(run_id)
 
     def _send_raw(self, rel_path: str):
         """Serve original media; supports HTTP Range for video seeking."""
@@ -4797,27 +4956,16 @@ class Handler(BaseHTTPRequestHandler):
         with open(full, 'rb') as f:
             shutil.copyfileobj(f, self.wfile)
 
-    def _send_thumb(self, rel_path: str):
-        """Serve thumbnail (same work fence as /raw; output under thumb_root)."""
-        if not rel_path:
-            self._send(b'missing', 'text/plain', 400); return
-        full = safe_under_work(self.work, rel_path)
-        if full is None:
-            self._send(b'forbidden', 'text/plain', 403); return
-        if not full.is_file():
-            self._send(b'not found', 'text/plain', 404); return
-        thumb = thumb_for(full, self.work, self.thumb_root)
-        if not thumb or not thumb.exists():
-            self._send(b'no thumb', 'text/plain', 404); return
-        thumb_res = thumb.resolve()
+    def _send_cached_jpeg(self, jpeg_path: Path, missing_label: str = 'no thumb'):
+        """Serve a JPEG under thumb_root with ETag/Cache-Control (thumb or preview)."""
+        jpeg_res = jpeg_path.resolve()
         thumb_root_res = self.thumb_root.resolve()
-        if not path_is_under(thumb_res, thumb_root_res):
+        if not path_is_under(jpeg_res, thumb_root_res):
             self._send(b'forbidden', 'text/plain', 403); return
         try:
-            st = thumb_res.stat()
+            st = jpeg_res.stat()
         except OSError:
-            self._send(b'no thumb', 'text/plain', 404); return
-        # ETag from thumb mtime+size so browsers can revalidate without re-download.
+            self._send(missing_label.encode(), 'text/plain', 404); return
         etag = f'W/"{st.st_mtime_ns:x}-{st.st_size:x}"'
         cache_ctrl = 'private, max-age=86400'
         inm = self.headers.get('If-None-Match')
@@ -4832,9 +4980,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         try:
-            data = thumb_res.read_bytes()
+            data = jpeg_res.read_bytes()
         except OSError:
-            self._send(b'no thumb', 'text/plain', 404); return
+            self._send(missing_label.encode(), 'text/plain', 404); return
         self.send_response(200)
         self.send_header('Content-Type', 'image/jpeg')
         self.send_header('Cache-Control', cache_ctrl)
@@ -4846,6 +4994,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_thumb(self, rel_path: str):
+        """Serve thumbnail (same work fence as /raw; output under thumb_root)."""
+        if not rel_path:
+            self._send(b'missing', 'text/plain', 400); return
+        full = safe_under_work(self.work, rel_path)
+        if full is None:
+            self._send(b'forbidden', 'text/plain', 403); return
+        if not full.is_file():
+            self._send(b'not found', 'text/plain', 404); return
+        thumb = thumb_for(full, self.work, self.thumb_root)
+        if not thumb or not thumb.exists():
+            self._send(b'no thumb', 'text/plain', 404); return
+        self._send_cached_jpeg(thumb, missing_label='no thumb')
+
+    def _send_preview(self, rel_path: str):
+        """Serve large JPEG preview for HEIC/RAW lightbox (work-fenced)."""
+        if not rel_path:
+            self._send(b'missing', 'text/plain', 400); return
+        full = safe_under_work(self.work, rel_path)
+        if full is None:
+            self._send(b'forbidden', 'text/plain', 403); return
+        if not full.is_file():
+            self._send(b'not found', 'text/plain', 404); return
+        # Native-browser formats should use /raw; still allow preview as fallback.
+        preview = preview_for(full, self.work, self.thumb_root)
+        if not preview or not preview.exists():
+            self._send(b'no preview', 'text/plain', 404); return
+        self._send_cached_jpeg(preview, missing_label='no preview')
 
     @staticmethod
     def _theme_bucket_href(month: str, name: str) -> str:
@@ -5104,9 +5281,15 @@ def main():
         'rename_dry':   lambda _b: ['python3', str(RENAME_SCRIPT), '--work', w, '--dry-run'],
         'rename_apply': lambda _b: ['python3', str(RENAME_SCRIPT), '--work', w],
 
-        # --- sync to backup (rsync; apply really mirrors) ---
-        'sync_verify':  lambda b: ['bash', str(SYNC_SCRIPT), '--work', w, '--backup', b, '--verify', '--dry-run'],
-        'sync_apply':   lambda b: ['bash', str(SYNC_SCRIPT), '--work', w, '--backup', b, '--verify'],
+        # --- sync to backup (rsync; --progress avoids -v file-list flood) ---
+        'sync_verify':  lambda b: [
+            'bash', str(SYNC_SCRIPT), '--work', w, '--backup', b,
+            '--progress', '--verify', '--dry-run',
+        ],
+        'sync_apply':   lambda b: [
+            'bash', str(SYNC_SCRIPT), '--work', w, '--backup', b,
+            '--progress', '--verify',
+        ],
 
         # --- one-shot pipeline (picvault uses WORK/BACKUP from env) ---
         'pipeline':     lambda _b: [pb, 'pipeline', '--yes'],

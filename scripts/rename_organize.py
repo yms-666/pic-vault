@@ -2,11 +2,12 @@
 """
 rename_organize.py - Rename + organize photos/videos into by-date / screenshots / screenrecords.
 
-Classification (v7):
+Classification (v8):
   0. Known camera filename → by-date/ (normal)
   Images:
-    1. Filename contains "screenshot" → screenshots/
-    2. No EXIF GPS → screenshots/
+    1. Maker evidence (EXIF Make or archived whitelist source in name) → by-date/
+    2. Filename contains "screenshot" → screenshots/
+    3. No EXIF GPS → screenshots/
   Videos:
     1. Filename contains "record" → screenrecords/
     2. Missing Make OR missing GPS → screenrecords/
@@ -15,6 +16,7 @@ Classification (v7):
 Usage:
     ./rename_organize.py --work /Volumes/Storage --dry-run
     ./rename_organize.py --work /Volumes/Storage
+    ./rename_organize.py --work /Volumes/Storage --fix-maker-screenshots [--dry-run]
 """
 
 import argparse
@@ -374,28 +376,66 @@ def _normalize_source(name: str) -> str:
     return s or 'unknown'
 
 
-# === Capture classification (v7) ===
+# === Capture classification (v8) ===
+
+_ARCHIVE_PREFIX_RE = re.compile(
+    r'^(?:screenshot_|screenrecorder_|doc_|things_)',
+    re.IGNORECASE,
+)
+
+
+def archived_stem_name(name: str) -> str:
+    """Strip optional archive bucket prefix for archived-name parsing."""
+    return _ARCHIVE_PREFIX_RE.sub('', name, count=1)
+
+
+def source_from_archived_filename(name: str) -> Optional[str]:
+    """Return whitelist source token from an archived filename, else None.
+
+    Accepts both normal names (`20231029_150334_sony_171c.jpg`) and bucket-
+    prefixed ones (`screenshot_20231029_150334_sony_171c.jpg`).
+    """
+    _, source = parse_archived_name(archived_stem_name(name))
+    if not source:
+        return None
+    src = source.lower()
+    return src if src in SOURCE_WHITELIST else None
+
+
+def has_maker_evidence(path: Path, exif: dict = None,
+                       video_tags: dict = None) -> bool:
+    """True if camera Make is present or archived filename has a whitelist source."""
+    if is_image(path):
+        if exif is None:
+            exif = read_exif(path)
+        if has_camera_make(exif):
+            return True
+    elif is_video(path) and has_video_make(video_tags or {}):
+        return True
+    return source_from_archived_filename(path.name) is not None
+
 
 def classify_capture(path: Path, exif: dict, video_tags: dict,
                       screenshot_keywords: list = None,
                       recording_keywords: list = None,
                       no_gps: bool = True) -> str:
-    """v7 classification: 'recording' | 'screenshot' | 'normal'.
+    """v8 classification: 'recording' | 'screenshot' | 'normal'.
 
     Logic:
       0. Known camera filename → normal
       Images:
-        1. Filename contains screenshot keyword → screenshot
-        2. No EXIF GPS → screenshot
+        1. Maker evidence (EXIF Make or archived whitelist source) → normal
+        2. Filename contains screenshot keyword → screenshot
+        3. No EXIF GPS → screenshot
       Videos:
         1. Filename contains record keyword → recording
         2. Missing Make OR missing GPS → recording
       Else → normal
 
     ``no_gps`` is kept for CLI compatibility; aggressive GPS/Make rules are
-    always on in v7 (the flag is ignored).
+    always on in v8 (the flag is ignored).
     """
-    del no_gps  # always-on in v7
+    del no_gps  # always-on in v8
     screenshot_keywords = screenshot_keywords or DEFAULT_SCREENSHOT_KEYWORDS
     recording_keywords = recording_keywords or DEFAULT_RECORDING_KEYWORDS
 
@@ -419,6 +459,8 @@ def classify_capture(path: Path, exif: dict, video_tags: dict,
         return 'normal'
 
     # Images (and other non-video media)
+    if has_maker_evidence(path, exif=exif):
+        return 'normal'
     for kw in screenshot_keywords:
         if kw.lower() in name_normalized:
             return 'screenshot'
@@ -743,6 +785,48 @@ def plan_destination(work: Path, path: Path, force_type: Optional[str] = None,
         exif=exif, video_tags=video_tags,
     )
     return dest, capture_type, new_name
+
+
+def iter_screenshot_media(work: Path):
+    """Yield media Paths directly under work/screenshots/."""
+    root = work / 'screenshots'
+    if not root.is_dir():
+        return
+    for p in sorted(root.iterdir()):
+        if p.is_file() and is_media_file(p):
+            yield p
+
+
+def find_maker_screenshots(work: Path) -> list:
+    """Screenshots that have maker evidence and should move to by-date/."""
+    hits = []
+    for path in iter_screenshot_media(work):
+        try:
+            exif = read_exif(path) if is_image(path) else {}
+            tags = read_video_metadata(path) if is_video(path) else {}
+            if has_maker_evidence(path, exif=exif, video_tags=tags):
+                hits.append(path)
+        except Exception:
+            continue
+    return hits
+
+
+def fix_maker_screenshots(work: Path, dry_run: bool = False,
+                          events: list = None) -> list:
+    """Move maker-evidence screenshots back to by-date via to_normal."""
+    paths = find_maker_screenshots(work)
+    if not paths:
+        return []
+    work_res = work.resolve()
+    rels = []
+    for p in paths:
+        try:
+            rels.append(str(p.resolve().relative_to(work_res)))
+        except ValueError:
+            continue
+    return reclassify_paths(
+        work, rels, 'to_normal', dry_run=dry_run, events=events,
+    )
 
 
 def reclassify_paths(work: Path, paths: list, action: str,
@@ -2172,6 +2256,11 @@ def main():
     parser.add_argument('--all', dest='all_themes', action='store_true',
                         help='With --rebucket-themes: sync all themes (may overwrite '
                              'manual moves in every theme bucket)')
+    parser.add_argument(
+        '--fix-maker-screenshots', action='store_true',
+        help='Move screenshots/ files with EXIF Make or archived whitelist '
+             'source (e.g. screenshot_…_sony_…) back to by-date/',
+    )
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
 
@@ -2188,6 +2277,24 @@ def main():
         print(f"ERROR: events.yaml: {e}", file=sys.stderr)
         sys.exit(1)
     print(f"→ Loaded {len(events)} themes from events.yaml")
+
+    if args.fix_maker_screenshots:
+        mode = 'dry-run' if args.dry_run else 'apply'
+        print(f'→ Fix maker screenshots ({mode})')
+        results = fix_maker_screenshots(work, dry_run=args.dry_run, events=events)
+        moved = sum(1 for r in results if r.get('ok') and not r.get('skipped'))
+        skipped = sum(1 for r in results if r.get('skipped'))
+        errors = sum(1 for r in results if not r.get('ok'))
+        for r in results:
+            src = r.get('src')
+            dest = r.get('dest')
+            if r.get('ok') and not r.get('skipped'):
+                print(f"  {'DRY ' if args.dry_run else ''}{src} → {dest}")
+            elif not r.get('ok'):
+                print(f"  ERROR {src}: {r.get('error')}", file=sys.stderr)
+        print(f"→ done: {moved} moved, {skipped} skipped, {errors} errors"
+              f" ({len(results)} candidates)")
+        sys.exit(1 if errors else 0)
 
     if args.rebucket_themes:
         theme_names = [t.strip() for t in (args.theme or []) if str(t).strip()]

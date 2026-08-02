@@ -78,6 +78,20 @@ def test_dashboard_pipeline_button():
         'runCommand sends backup for sync/pipeline',
         "body.backup = paths.backup" in text and "cmdName === 'pipeline'" in text,
     )
+    check(
+        'live output batches DOM updates',
+        'function flushLiveLineBuffers' in text and '_liveLineBuf' in text,
+    )
+    check(
+        'beginLiveOutput clears live buffer',
+        'function beginLiveOutput' in text
+        and 'clearLiveLineBuffers()' in text.split('function beginLiveOutput')[1].split('function ')[0],
+    )
+    check(
+        'finishLiveOutput flushes live buffer',
+        'function finishLiveOutput' in text
+        and 'flushLiveLineBuffers()' in text.split('function finishLiveOutput')[1].split('function ')[0],
+    )
 
 
 def test_dashboard_web_start_copy():
@@ -337,18 +351,30 @@ def test_run_commands_backup_and_pipeline():
     w = '/Volumes/YM/MediaVault'
     pb = str(wb.PICVAULT_BIN)
     cmds = {
-        'sync_verify': lambda b: ['bash', str(wb.SYNC_SCRIPT), '--work', w, '--backup', b, '--verify', '--dry-run'],
-        'sync_apply': lambda b: ['bash', str(wb.SYNC_SCRIPT), '--work', w, '--backup', b, '--verify'],
+        'sync_verify': lambda b: [
+            'bash', str(wb.SYNC_SCRIPT), '--work', w, '--backup', b,
+            '--progress', '--verify', '--dry-run',
+        ],
+        'sync_apply': lambda b: [
+            'bash', str(wb.SYNC_SCRIPT), '--work', w, '--backup', b,
+            '--progress', '--verify',
+        ],
         'pipeline': lambda _b: [pb, 'pipeline', '--yes'],
         'dedupe_dry': lambda _b: ['python3', str(wb.DEDUPE_SCRIPT), '--work', w, '--dry-run'],
     }
     custom = '/Volumes/WD4T/MediaVault'
     sync_argv = cmds['sync_verify'](custom)
     check('sync_verify embeds backup', custom in sync_argv)
+    check('sync_verify uses --progress', '--progress' in sync_argv)
     other = '/Volumes/YM/MediaVault'
     check('sync_apply honors alternate backup', other in cmds['sync_apply'](other))
+    check('sync_apply uses --progress', '--progress' in cmds['sync_apply'](other))
     pipe = cmds['pipeline'](custom)
     check('pipeline argv is picvault pipeline --yes', pipe[-2:] == ['pipeline', '--yes'])
+
+    # Also assert the live server registration shape (source text).
+    src = (PROJECT_ROOT / 'scripts' / 'web_browse.py').read_text(encoding='utf-8')
+    check('web_browse sync_verify passes --progress', "'--progress'" in src and 'sync_verify' in src)
 
 
 def test_backup_validation():
@@ -1164,6 +1190,104 @@ def test_rebucket_cli_requires_theme_or_all():
                 os.environ.pop('DUPEGURU_TEST', None)
             else:
                 os.environ['DUPEGURU_TEST'] = old_env
+
+
+def test_heic_lightbox_uses_jpeg_preview():
+    """HEIC lightbox must use /preview JPEG; 查看原图 keeps /raw."""
+    print('\n15a. HEIC lightbox uses /preview (not raw HEIC)')
+    check('heic needs jpeg preview', wb.needs_jpeg_preview(Path('a.heic')))
+    check('heif needs jpeg preview', wb.needs_jpeg_preview(Path('a.HEIF')))
+    check('jpg does not need preview', not wb.needs_jpeg_preview(Path('a.jpg')))
+    check('png does not need preview', not wb.needs_jpeg_preview(Path('a.png')))
+    check('mp4 does not need preview', not wb.needs_jpeg_preview(Path('a.mp4')))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / 'work'
+        photos = work / 'by-date' / '2023' / '2023-10' / 'photos'
+        photos.mkdir(parents=True)
+        heic = photos / '20231029_150334_iphone_abcd.heic'
+        jpg = photos / '20231029_150335_iphone_abce.jpg'
+        heic.write_bytes(b'fake-heic')
+        jpg.write_bytes(b'fake-jpg')
+        thumb_root = work / '_meta' / 'thumbs'
+        thumb_root.mkdir(parents=True)
+
+        heic_html = wb._media_cell(heic, work, thumb_root, '2023-10', {}, 1)
+        jpg_html = wb._media_cell(jpg, work, thumb_root, '2023-10', {}, 2)
+        check(
+            'heic data-lightbox is /preview',
+            'data-lightbox="/preview?' in heic_html,
+            detail=heic_html,
+        )
+        check(
+            'heic data-raw stays /raw',
+            'data-raw="/raw?' in heic_html,
+            detail=heic_html,
+        )
+        check(
+            'jpg data-lightbox is /raw',
+            'data-lightbox="/raw?' in jpg_html and 'data-lightbox="/preview?' not in jpg_html,
+            detail=jpg_html,
+        )
+        check(
+            'openLightbox prefers data-raw for 查看原图',
+            "getAttribute('data-raw')" in wb.PAGE_JS and 'raw.href = rawHref' in wb.PAGE_JS,
+        )
+
+        jpeg_hdr = b'\xff\xd8\xff\xe0\x00\x10JFIF'
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            out = Path(cmd[cmd.index('--out') + 1])
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_bytes(jpeg_hdr + b'preview')
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        import subprocess
+        old = subprocess.run
+        try:
+            subprocess.run = fake_run
+            got = wb.preview_for(heic, work, thumb_root)
+        finally:
+            subprocess.run = old
+
+        expected = thumb_root / heic.relative_to(work).with_suffix('.preview.jpg')
+        check('preview_for returns .preview.jpg path', got == expected)
+        check('preview is jpeg bytes', got is not None and wb._is_jpeg_bytes(got))
+        check(
+            'preview sips uses PREVIEW_SIZE',
+            any(str(wb.PREVIEW_SIZE) in c for c in calls),
+            detail=str(calls),
+        )
+
+        # HTTP /preview serves image/jpeg
+        class H(wb.Handler):
+            pass
+
+        H.work = work
+        H.thumb_root = thumb_root
+        from http.server import ThreadingHTTPServer
+        import threading
+        import urllib.request
+
+        httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            rel = urllib.parse.quote(str(heic.relative_to(work)))
+            with urllib.request.urlopen(f'http://127.0.0.1:{port}/preview?p={rel}') as r:
+                body = r.read()
+                ctype = r.headers.get('Content-Type', '')
+            check('GET /preview content-type jpeg', 'image/jpeg' in ctype, detail=ctype)
+            check('GET /preview body is jpeg', body.startswith(b'\xff\xd8\xff'))
+        finally:
+            httpd.shutdown()
 
 
 def test_heic_thumb_forces_jpeg():
@@ -2913,6 +3037,268 @@ def test_lightbox_blank_area_click_closes_preview():
     )
 
 
+def test_run_stream_survives_slow_client_and_cancel_kills_group():
+    """Chatty run must finish logging even if NDJSON client stalls; cancel kills pg."""
+    print('\n35. Run stream stall fix + process-group cancel')
+    import subprocess
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    check('live emit includes head lines', wb.should_live_emit_stdout(1, 'x'))
+    check('live emit samples every N', wb.should_live_emit_stdout(wb.LIVE_STDOUT_EVERY, 'x'))
+    check(
+        'live emit skips mid lines',
+        not wb.should_live_emit_stdout(wb.LIVE_STDOUT_HEAD + 1, 'plain'),
+    )
+    check('live emit keeps summary markers', wb.should_live_emit_stdout(9999, '→ Done'))
+    check('start_new_session helper exists', callable(wb.terminate_run_process))
+
+    # Process-group kill must reap sleep children, not leave orphans.
+    proc = subprocess.Popen(
+        ['bash', '-c', 'sleep 120 & wait'],
+        start_new_session=True,
+    )
+    time.sleep(0.15)
+    wb.terminate_run_process(proc)
+    deadline = time.time() + 5
+    while time.time() < deadline and proc.poll() is None:
+        time.sleep(0.05)
+    check('terminate_run_process reaps session', proc.poll() is not None, detail=str(proc.poll()))
+
+    n_lines = 2500
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / 'work'
+        for name in ('inbox', 'by-date', 'screenshots', '_meta'):
+            (work / name).mkdir(parents=True)
+        thumb_root = work / '_meta' / 'thumbs'
+        thumb_root.mkdir(parents=True)
+
+        flood = [
+            sys.executable, '-u', '-c',
+            (
+                f'import sys\n'
+                f'for i in range({n_lines}):\n'
+                f'    print(f\"line-{{i}}\", flush=True)\n'
+                f'print(\"→ Done\", flush=True)\n'
+            ),
+        ]
+        old_cmds = dict(wb.RUN_COMMANDS)
+        try:
+            wb.RUN_COMMANDS.clear()
+            wb.RUN_COMMANDS['flood_test'] = lambda _b: flood
+            wb._ACTIVE_RUN = None
+            wb._ACTIVE_PROC = None
+            wb._CANCEL_REQUESTED = False
+
+            class H(wb.Handler):
+                pass
+
+            H.work = work
+            H.thumb_root = thumb_root
+            httpd = ThreadingHTTPServer(('127.0.0.1', 0), H)
+            port = httpd.server_address[1]
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            base = f'http://127.0.0.1:{port}'
+
+            def start_run_slow_client():
+                req = urllib.request.Request(
+                    base + '/api/run',
+                    data=json.dumps({'command': 'flood_test'}).encode(),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST',
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        # Read a tiny prefix then stall — mimics a frozen dashboard.
+                        resp.read(64)
+                        time.sleep(2.5)
+                        while resp.read(65536):
+                            pass
+                except Exception:
+                    pass
+
+            threading.Thread(target=start_run_slow_client, daemon=True).start()
+
+            meta = None
+            deadline = time.time() + 45
+            while time.time() < deadline:
+                latest = work / '_meta' / 'logs' / 'runs' / 'latest.json'
+                if latest.is_file():
+                    meta = json.loads(latest.read_text(encoding='utf-8'))
+                    if meta.get('status') in ('ok', 'error', 'cancelled'):
+                        break
+                time.sleep(0.1)
+
+            check(
+                'flood run reaches terminal status',
+                bool(meta) and meta.get('status') == 'ok',
+                detail=repr(meta),
+            )
+            if meta and meta.get('log'):
+                log_text = (work / meta['log']).read_text(encoding='utf-8')
+                check(
+                    'flood log kept every stdout line',
+                    log_text.count('[stdout] line-') == n_lines,
+                    detail=str(log_text.count('[stdout] line-')),
+                )
+                check('flood log kept summary line', '[stdout] → Done' in log_text)
+            else:
+                check('flood log kept every stdout line', False, detail='no meta.log')
+                check('flood log kept summary line', False)
+
+            # Cancel path: long sleep session must die.
+            wb.RUN_COMMANDS['sleep_test'] = lambda _b: [
+                'bash', '-c', 'sleep 120 & wait',
+            ]
+            wb._ACTIVE_RUN = None
+            wb._ACTIVE_PROC = None
+            wb._CANCEL_REQUESTED = False
+
+            def start_sleep_run():
+                req = urllib.request.Request(
+                    base + '/api/run',
+                    data=json.dumps({'command': 'sleep_test'}).encode(),
+                    headers={'Content-Type': 'application/json'},
+                    method='POST',
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=30).read()
+                except Exception:
+                    pass
+
+            threading.Thread(target=start_sleep_run, daemon=True).start()
+            # Wait until active
+            for _ in range(50):
+                if wb._ACTIVE_PROC is not None and wb._ACTIVE_PROC.poll() is None:
+                    break
+                time.sleep(0.05)
+            cancel_req = urllib.request.Request(
+                base + '/api/runs/cancel',
+                data=b'{}',
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            with urllib.request.urlopen(cancel_req, timeout=10) as r:
+                cancel_body = json.loads(r.read().decode())
+            check('cancel api ok', cancel_body.get('ok') is True and cancel_body.get('cancelled') is True)
+
+            deadline = time.time() + 10
+            cancel_meta = None
+            while time.time() < deadline:
+                latest = work / '_meta' / 'logs' / 'runs' / 'latest.json'
+                if latest.is_file():
+                    cancel_meta = json.loads(latest.read_text(encoding='utf-8'))
+                    if cancel_meta.get('command_name') == 'sleep_test' and cancel_meta.get(
+                        'status'
+                    ) in ('cancelled', 'error', 'ok'):
+                        break
+                time.sleep(0.1)
+            check(
+                'cancel finalizes meta',
+                bool(cancel_meta) and cancel_meta.get('status') == 'cancelled',
+                detail=repr(cancel_meta),
+            )
+            check('no active proc after cancel', wb._ACTIVE_PROC is None or wb._ACTIVE_PROC.poll() is not None)
+
+            # While stream may still be draining, a second /api/run must not start.
+            # Hold the slot artificially (cancelled meta) and assert mutex.
+            wb._ACTIVE_RUN = {'id': 'drain-hold', 'status': 'cancelled', 'command_name': 'x'}
+            wb._ACTIVE_PROC = None
+            overlap_req = urllib.request.Request(
+                base + '/api/run',
+                data=json.dumps({'command': 'flood_test'}).encode(),
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            with urllib.request.urlopen(overlap_req, timeout=10) as r:
+                overlap_body = json.loads(r.read().decode())
+            check(
+                'overlap rejected while slot held',
+                overlap_body.get('ok') is False
+                and '收尾' in (overlap_body.get('error') or ''),
+                detail=repr(overlap_body),
+            )
+            wb._ACTIVE_RUN = None
+        finally:
+            wb.RUN_COMMANDS.clear()
+            wb.RUN_COMMANDS.update(old_cmds)
+            wb._ACTIVE_RUN = None
+            wb._ACTIVE_PROC = None
+            wb._CANCEL_REQUESTED = False
+            try:
+                httpd.shutdown()
+            except Exception:
+                pass
+
+
+def test_maker_evidence_not_screenshot():
+    """v8: EXIF Make / archived whitelist source beat screenshot classification."""
+    print('\n34. Maker evidence → not screenshot (v8)')
+    import rename_organize as ro
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp) / 'work'
+        for name in ('inbox', 'by-date', 'screenshots', '_meta'):
+            (work / name).mkdir(parents=True)
+
+        # Make without GPS, non-camera name → normal
+        p = work / 'inbox' / 'vacation_raw.jpg'
+        img = Image.new('RGB', (80, 80), color='green')
+        exif = img.getexif()
+        exif[0x010F] = 'SONY'
+        exif[0x9003] = '2023:10:29 15:03:34'
+        img.save(str(p), 'JPEG', exif=exif.tobytes())
+        got = ro.classify_capture(p, ro.read_exif(p), {})
+        check('Make without GPS → normal', got == 'normal', detail=got)
+
+        # Filename keyword screenshot but Make present → normal
+        p2 = work / 'inbox' / 'Screenshot_from_camera.jpg'
+        img2 = Image.new('RGB', (80, 80), color='blue')
+        exif2 = img2.getexif()
+        exif2[0x010F] = 'Canon'
+        img2.save(str(p2), 'JPEG', exif=exif2.tobytes())
+        got2 = ro.classify_capture(p2, ro.read_exif(p2), {})
+        check('screenshot keyword + Make → normal', got2 == 'normal', detail=got2)
+
+        # Archived name with whitelist source (no EXIF) → maker evidence
+        stock = work / 'screenshots' / 'screenshot_20231029_150334_sony_171c.jpg'
+        stock.write_bytes(b'fake-jpeg')
+        check(
+            'archived sony token is maker evidence',
+            ro.source_from_archived_filename(stock.name) == 'sony',
+        )
+        check(
+            'has_maker_evidence from filename',
+            ro.has_maker_evidence(stock, exif={}),
+        )
+        got3 = ro.classify_capture(stock, {}, {})
+        check('screenshot_…_sony_… → normal', got3 == 'normal', detail=got3)
+
+        # True screenshot (no Make, no source token) still screenshot
+        true_shot = work / 'inbox' / 'Screenshot_2026-07-15.png'
+        Image.new('RGB', (40, 40), color='red').save(str(true_shot), 'PNG')
+        got4 = ro.classify_capture(true_shot, {}, {})
+        check('plain Screenshot_ PNG → screenshot', got4 == 'screenshot', detail=got4)
+
+        # Stock fix moves maker screenshot to by-date
+        results = ro.fix_maker_screenshots(work, dry_run=False)
+        check('fix_maker_screenshots moves one file', len(results) == 1 and results[0].get('ok'))
+        check('stock file left screenshots/', not stock.exists())
+        dest = work / results[0]['dest']
+        check(
+            'stock file landed in by-date/',
+            results[0]['dest'].startswith('by-date/') and dest.is_file(),
+            detail=results[0].get('dest'),
+        )
+        check(
+            'fixed name drops screenshot_ prefix',
+            not dest.name.startswith('screenshot_'),
+            detail=dest.name,
+        )
+
+
 def main():
     print('Bugbot fix regression checks')
     test_dashboard_pipeline_button()
@@ -2939,6 +3325,7 @@ def main():
     test_rename_rebuckets_when_inbox_empty()
     test_scoped_theme_sync_ignores_other_theme()
     test_rebucket_cli_requires_theme_or_all()
+    test_heic_lightbox_uses_jpeg_preview()
     test_heic_thumb_forces_jpeg()
     test_append_theme_from_empty_list()
     test_theme_parse_validate_hardening()
@@ -2962,6 +3349,8 @@ def main():
     test_lightbox_video_controls_not_covered_by_action_bar()
     test_sticky_gallery_toolbar_title_stats_and_top_action()
     test_lightbox_blank_area_click_closes_preview()
+    test_run_stream_survives_slow_client_and_cancel_kills_group()
+    test_maker_evidence_not_screenshot()
     print(f'\n{passed} passed, {failed} failed')
     sys.exit(1 if failed else 0)
 
